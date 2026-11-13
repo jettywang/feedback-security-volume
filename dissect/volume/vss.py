@@ -6,7 +6,7 @@ import os
 import uuid
 from collections import defaultdict
 from functools import cached_property
-from typing import TYPE_CHECKING, BinaryIO
+from typing import TYPE_CHECKING, BinaryIO, NamedTuple
 
 from dissect.cstruct import cstruct
 from dissect.util.stream import AlignedStream
@@ -158,6 +158,8 @@ BLOCK_FLAG = c_vss.BLOCK_FLAG
 VSS_IDENTIFIER = b"\x6b\x87\x08\x38\x76\xc1\x48\x4e\xb7\xae\x04\x04\x6e\x6c\xc7\x52"
 VOLUME_HEADER_OFFSET = 0x1E00
 BLOCK_SIZE = 0x4000
+SECTOR_SIZE = 512
+SECTORS_PER_BLOCK = BLOCK_SIZE // SECTOR_SIZE
 
 CATALOG_BLOCK_SIZE = 0x4000
 CATALOG_ENTRY_SIZE = 128
@@ -246,7 +248,58 @@ class Catalog:
         return f"<Catalog stores={len(self.stores)}>"
 
 
-DEBUG = False
+class SectorSource(NamedTuple):
+    """Provenance of a single 512-byte sector of a recovered block.
+
+    Attributes:
+        sector: Sector index within the block (0-31).
+        origin: Where the sector data came from. One of ``store-data``, ``forwarder``,
+            ``overlay``, ``volume-reverse-map``, ``volume`` or ``zero-fill-bitmap``.
+        store_index: Index of the store that physically provided the data, or ``None``
+            when the data came from the current volume or was zero-filled.
+        file_offset: Absolute file offset the sector was read from, or ``None`` for
+            zero-filled sectors.
+    """
+
+    sector: int
+    origin: str
+    store_index: int | None
+    file_offset: int | None
+
+
+class BlockRead:
+    """Result of resolving one volume block through the store chain.
+
+    Carries both the recovered ``data`` and its provenance: ``decisions`` is the
+    ordered decision chain that was followed through the stores, and ``sectors``
+    holds a :class:`SectorSource` for every 512-byte sector, recorded at the exact
+    spot where that sector was physically read (or zero-filled). Sectors that could
+    not be resolved remain ``None`` and are listed in :attr:`unknown_sectors`.
+    """
+
+    def __init__(self, block: int):
+        self.block = block
+        self.decisions: list[str] = []
+        self.sectors: list[SectorSource | None] = [None] * SECTORS_PER_BLOCK
+        self.data: bytes | None = None
+
+    def set_source(self, origin: str, store_index: int | None, file_offset: int | None) -> None:
+        """Attribute every sector of the block to a single origin."""
+        for sector in range(SECTORS_PER_BLOCK):
+            offset = file_offset + sector * SECTOR_SIZE if file_offset is not None else None
+            self.sectors[sector] = SectorSource(sector, origin, store_index, offset)
+
+    @property
+    def unknown_sectors(self) -> list[int]:
+        return [sector for sector in range(SECTORS_PER_BLOCK) if self.sectors[sector] is None]
+
+    @property
+    def complete(self) -> bool:
+        """Whether the block was fully recovered and every sector has a known source."""
+        return self.data is not None and len(self.data) == BLOCK_SIZE and not self.unknown_sectors
+
+    def __repr__(self) -> str:
+        return f"<BlockRead block={self.block} complete={self.complete}>"
 
 
 class Store:
@@ -305,130 +358,130 @@ class Store:
         return StoreBitmap(self, self.desc3.store_bitmap_offset)
 
     @cached_property
-    def previous_bitmap(self) -> StoreBitmap:
+    def previous_bitmap(self) -> StoreBitmap | None:
+        if not self.desc3.store_previous_bitmap_offset:
+            return None
         return StoreBitmap(self, self.desc3.store_previous_bitmap_offset)
 
+    def _read_exact(self, offset: int, length: int = BLOCK_SIZE) -> bytes:
+        self.fh.seek(offset)
+        buf = self.fh.read(length)
+        if len(buf) != length:
+            raise Error(
+                f"Short read at offset 0x{offset:x} in store {self.index} (got {len(buf)}, expected {length})"
+            )
+        return buf
+
     def read_block(self, block: int, active_store: Store | None = None) -> bytes:
+        return self.read_block_ex(block, active_store=active_store).data
+
+    def read_block_ex(
+        self, block: int, active_store: Store | None = None, _visited: set[tuple[int, int]] | None = None
+    ) -> BlockRead:
+        """Resolve a volume block to its historical contents, recording provenance.
+
+        Decision chain, evaluated in order:
+
+        1. Block list hit, ``IS_FORWARDER`` with a newer store: recurse into
+           ``next_store`` at ``relative_offset`` (cycle-guarded).
+        2. Block list hit, ``IS_FORWARDER`` without a newer store: read
+           ``relative_offset`` from this store's own file (``forwarder``).
+        3. Block list hit, regular descriptor: read ``store_offset`` (``store-data``).
+        4. No descriptor (or overlay-only descriptor) with a newer store: recurse
+           into ``next_store`` at the same block number.
+        5. Newest store, reverse mapping hit: read the block from the current
+           volume (``volume-reverse-map``).
+        6. Newest store, block in use by the store bitmap (and the previous
+           bitmap, if any): the block was never written, return zeroes
+           (``zero-fill-bitmap``).
+        7. Otherwise: read the block from the current volume (``volume``).
+
+        Afterwards, if this store is the active store and the descriptor carries
+        overlay data, the bitmap-selected 512-byte sectors are patched on top of
+        the forwarded/resolved block (``overlay``).
+
+        Raises:
+            Error: On circular block references or short reads, neither of which
+                may be mistaken for a complete historical block.
+        """
         active_store = active_store or self
 
-        buf = None
+        visited = _visited if _visited is not None else set()
+        token = (id(self), block)
+        if token in visited:
+            raise Error(f"Circular block reference while resolving block {block} in store {self.index}")
+        visited.add(token)
+
+        result = BlockRead(block)
         descriptor = self.block_list.map.map.get(block)
-        if DEBUG:
-            print(block, descriptor)
-        # if descriptor:
-        #     import ipdb; ipdb.set_trace()
 
-        # if descriptor and descriptor.is_overlay:
-        #     import ipdb; ipdb.set_trace()
-
-        if descriptor:
-            if descriptor.is_forwarder:
-                if self.next_store:
-                    print("DEBUG THIS")
-                    buf = self.next_store.read_block(descriptor.relative_offset // 0x4000, self)
-                else:
-                    self.fh.seek(descriptor.relative_offset)
-                    buf = self.fh.read(BLOCK_SIZE)
-            elif not descriptor.is_overlay:
-                # print("reading from store")
-                self.fh.seek(descriptor.store_offset)
-                buf = self.fh.read(BLOCK_SIZE)
-
-        if not descriptor or descriptor.is_overlay:
+        if descriptor and descriptor.is_forwarder:
             if self.next_store:
-                # print("reading from next store")
-                buf = self.next_store.read_block(block, self)
+                next_block = descriptor.relative_offset // BLOCK_SIZE
+                result = self.next_store.read_block_ex(next_block, self, visited)
+                result.decisions.insert(
+                    0,
+                    f"store {self.index}: block {block} is a forwarder to block {next_block}"
+                    f" in store {self.next_store.index}",
+                )
             else:
-                reverse_descriptor = self.block_list.map.reverse.get(block)
-                if reverse_descriptor:
-                    # print("found reverse descriptor, reading from volume")
-                    self.fh.seek(block * BLOCK_SIZE)
-                    buf = self.fh.read(BLOCK_SIZE)
-                elif self.bitmap.in_use(block) and (not self.previous_bitmap or self.previous_bitmap.in_use(block)):
-                    # print("sparse block?")
-                    buf = b"\x00" * BLOCK_SIZE
-                else:
-                    # print("nothing matched, reading from volume")
-                    self.fh.seek(block * BLOCK_SIZE)
-                    buf = self.fh.read(BLOCK_SIZE)
-
-        if not buf:
-            print("booboo")
-            print("Descriptor", descriptor)
-            raise ValueError("Error reading block")
+                result.data = self._read_exact(descriptor.relative_offset)
+                result.set_source("forwarder", self.index, descriptor.relative_offset)
+                result.decisions.append(
+                    f"store {self.index}: block {block} is a forwarder, read from own file"
+                    f" at 0x{descriptor.relative_offset:x}"
+                )
+        elif descriptor and not descriptor.is_overlay:
+            result.data = self._read_exact(descriptor.store_offset)
+            result.set_source("store-data", self.index, descriptor.store_offset)
+            result.decisions.append(
+                f"store {self.index}: block {block} read from store data at 0x{descriptor.store_offset:x}"
+            )
+        elif self.next_store:
+            result = self.next_store.read_block_ex(block, self, visited)
+            result.decisions.insert(
+                0, f"store {self.index}: no local data for block {block}, forwarding to store {self.next_store.index}"
+            )
+        else:
+            reverse_descriptor = self.block_list.map.reverse.get(block)
+            if reverse_descriptor:
+                result.data = self._read_exact(block * BLOCK_SIZE)
+                result.set_source("volume-reverse-map", None, block * BLOCK_SIZE)
+                result.decisions.append(
+                    f"store {self.index}: block {block} has a reverse mapping, read from current volume"
+                    f" at 0x{block * BLOCK_SIZE:x}"
+                )
+            elif self.bitmap.in_use(block) and (not self.previous_bitmap or self.previous_bitmap.in_use(block)):
+                result.data = b"\x00" * BLOCK_SIZE
+                result.set_source("zero-fill-bitmap", None, None)
+                result.decisions.append(
+                    f"store {self.index}: block {block} marked unwritten in the store bitmap, zero-filled"
+                )
+            else:
+                result.data = self._read_exact(block * BLOCK_SIZE)
+                result.set_source("volume", None, block * BLOCK_SIZE)
+                result.decisions.append(
+                    f"store {self.index}: block {block} not found in any store, read from current volume"
+                    f" at 0x{block * BLOCK_SIZE:x}"
+                )
 
         if descriptor and active_store is self and (descriptor.is_overlay or descriptor.overlay):
-            # print("overlaying data")
-            buf = bytearray(buf)
             overlay = descriptor if descriptor.is_overlay else descriptor.overlay
             overlay_offset = overlay.store_offset
             bitmap = overlay.bitmap
 
-            for i in range(32):
+            buf = bytearray(result.data)
+            overlaid = []
+            for i in range(SECTORS_PER_BLOCK):
                 if (bitmap >> i) & 0x00000001:
-                    self.fh.seek(overlay_offset + (i * 512))
-                    buf[i * 512 : (i + 1) * 512] = self.fh.read(512)
+                    sector_offset = overlay_offset + (i * SECTOR_SIZE)
+                    buf[i * SECTOR_SIZE : (i + 1) * SECTOR_SIZE] = self._read_exact(sector_offset, SECTOR_SIZE)
+                    result.sectors[i] = SectorSource(i, "overlay", self.index, sector_offset)
+                    overlaid.append(i)
+            result.data = bytes(buf)
+            result.decisions.append(f"store {self.index}: applied overlay to sectors {overlaid}")
 
-        return bytes(buf)
-
-        #     if descriptor.is_forwarder:
-        #         block_data_offset = descriptor.relative_offset
-        #     else:
-        #         block_data_offset = descriptor.store_offset
-
-        #     if overlay:
-        #         if active_store is not self and descriptor is overlay:
-        #             print('weird shit')
-        #             descriptor = None
-        #         else:
-        #             overlay_offset = overlay.original_offset
-        #             overlay_bitmap = overlay.bitmap
-        #             pass
-
-        # if descriptor:
-        #     if descriptor.is_forwarder:
-        #         block_data_offset = descriptor.relative_offset
-        #     else:
-        #         block_data_offset = descriptor.store_offset
-
-        #     if descriptor.is_overlay:
-        #         overlay_block_descriptor = descriptor
-        #     else:
-        #         overlay_block_descriptor = descriptor.overlay
-
-        #     if overlay_block_descriptor:
-        #         if self.index != active_store.index and descriptor is overlay_block_descriptor:
-        #             descriptor = None
-        #         else:
-        #             overlay_block_offset = overlay_block_descriptor.original_offset
-        #             overlay_bitmap = overlay_block_descriptor.bitmap
-        #             # bitmap stuff
-
-        # if not descriptor:
-        #     if not self.next_store and self.index == active_store.index:
-        #         reverse_block_descriptor = self.block_list.map.reverse.get(block)
-        #         in_bitmap = self.bitmap.in_use(block)
-        #         in_previous_bitmap = self.previous_bitmap.in_use(block)
-
-        # if descriptor:
-        #     if descriptor.is_forwarder and self.next_store:
-        #         print("reading forwarder from next store")
-        #         return self.next_store.read_block(block, active_store)
-        #     else:
-        #         print("reading from current store")
-        #         self.fh.seek(block_data_offset)
-        #         return self.fh.read(BLOCK_SIZE)
-        # else:
-        #     if self.next_store:
-        #         print("reading from next store")
-        #         return self.next_store.read_block(block, active_store)
-        #     elif not reverse_block_descriptor and not in_bitmap and not in_previous_bitmap:
-        #         print("zero'ing")
-        #         return b'\x00' * BLOCK_SIZE
-        #     else:
-        #         print("reading from volume")
-        #         self.fh.seek(block * BLOCK_SIZE)
-        #         return self.fh.read(BLOCK_SIZE)
+        return result
 
 
 class StoreStream(AlignedStream):
