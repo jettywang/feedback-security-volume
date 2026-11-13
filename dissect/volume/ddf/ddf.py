@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import io
-from typing import TYPE_CHECKING, BinaryIO
+from typing import TYPE_CHECKING, BinaryIO, NamedTuple
 
 from dissect.util import ts
 
 from dissect.volume.ddf.c_ddf import c_ddf
-from dissect.volume.exceptions import DDFError
+from dissect.volume.exceptions import DDFError, DDFLayoutError
 from dissect.volume.raid.raid import (
     RAID,
     Configuration,
@@ -23,6 +23,17 @@ if TYPE_CHECKING:
 DEFAULT_SECTOR_SIZE = 512
 
 DECADE = 3600 * 24 * (365 * 10 + 2)
+
+# The DDF specification uses 0xFF in the Secondary RAID Level field to signal that no secondary level exists.
+DDF_VDCR_NO_SECONDARY = 0xFF
+
+# Linux MD style RAID10 layout encodings consumed by RAID10Stream: (far_copies << 8) | near_copies.
+RAID10_LAYOUT_NEAR2 = 0x102  # 2 near copies, 1 far copy
+RAID10_LAYOUT_NEAR3 = 0x103  # 3 near copies, 1 far copy
+RAID10_LAYOUT_OFFSET = 0x201  # 1 near copy, 2 far copies with offset
+
+# Qualifier wildcard for primary levels that do not define any qualifier semantics.
+_ANY_QUALIFIER = -1
 
 
 class DDF(RAID):
@@ -95,6 +106,7 @@ class DDFVirtualDisk(VirtualDisk):
             vdcr.secondary_raid_level,
             vdcr.primary_element_count,
             vdcr.secondary_element_count,
+            vdcr.secondary_element_seq,
         )
 
         super().__init__(
@@ -303,91 +315,172 @@ def _read_virtual_disk_configuration_records(
     return result
 
 
-def _convert_raid_layout(prl: int, rlq: int, srl: int, pec: int, sec: int) -> tuple[Level, Layout, int]:
-    """Convert DDF RAID layout to a layout we can work with.
+class _LayoutContract(NamedTuple):
+    """A single DDF layout combination and the generic RAID engine parameters it maps to.
+
+    Args:
+        primary_raid_level: The DDF Primary RAID Level this contract applies to.
+        raid_level_qualifier: The DDF RAID Level Qualifier, or ``_ANY_QUALIFIER`` if the level has no
+            qualifier semantics.
+        primary_element_count: The required Primary Element Count, or ``None`` if any count is valid.
+        level: The generic :class:`Level` produced for this combination.
+        layout: The generic :class:`Layout`/RAID10 layout produced, or ``None`` if the level has no layout.
+    """
+
+    primary_raid_level: int
+    raid_level_qualifier: int
+    primary_element_count: int | None
+    level: Level
+    layout: Layout | int | None
+
+
+# Contracts for single-element virtual disks (Secondary Element Count == 1), keyed by
+# (Primary RAID Level, RAID Level Qualifier). This is an explicit mapping table, not a rename of the
+# enums: each entry also pins the element counts that make the combination internally consistent.
+_SINGLE_LAYOUT_CONTRACTS: dict[tuple[int, int], _LayoutContract] = {
+    (c_ddf.DDF_VDCR_CONCAT, _ANY_QUALIFIER): _LayoutContract(
+        c_ddf.DDF_VDCR_CONCAT, _ANY_QUALIFIER, None, Level.LINEAR, None
+    ),
+    (c_ddf.DDF_VDCR_RAID0, c_ddf.DDF_VDCR_RAID0_SIMPLE): _LayoutContract(
+        c_ddf.DDF_VDCR_RAID0, c_ddf.DDF_VDCR_RAID0_SIMPLE, None, Level.RAID0, None
+    ),
+    (c_ddf.DDF_VDCR_RAID1, c_ddf.DDF_VDCR_RAID1_SIMPLE): _LayoutContract(
+        c_ddf.DDF_VDCR_RAID1, c_ddf.DDF_VDCR_RAID1_SIMPLE, 2, Level.RAID1, None
+    ),
+    (c_ddf.DDF_VDCR_RAID1, c_ddf.DDF_VDCR_RAID1_MULTI): _LayoutContract(
+        c_ddf.DDF_VDCR_RAID1, c_ddf.DDF_VDCR_RAID1_MULTI, 3, Level.RAID1, None
+    ),
+    (c_ddf.DDF_VDCR_RAID1E, c_ddf.DDF_VDCR_RAID1E_ADJACENT): _LayoutContract(
+        c_ddf.DDF_VDCR_RAID1E, c_ddf.DDF_VDCR_RAID1E_ADJACENT, None, Level.RAID10, RAID10_LAYOUT_NEAR2
+    ),
+    (c_ddf.DDF_VDCR_RAID1E, c_ddf.DDF_VDCR_RAID1E_OFFSET): _LayoutContract(
+        c_ddf.DDF_VDCR_RAID1E, c_ddf.DDF_VDCR_RAID1E_OFFSET, None, Level.RAID10, RAID10_LAYOUT_OFFSET
+    ),
+    (c_ddf.DDF_VDCR_RAID4, c_ddf.DDF_VDCR_RAID4_N): _LayoutContract(
+        c_ddf.DDF_VDCR_RAID4, c_ddf.DDF_VDCR_RAID4_N, None, Level.RAID4, None
+    ),
+    (c_ddf.DDF_VDCR_RAID5, c_ddf.DDF_VDCR_RAID5_N_RESTART): _LayoutContract(
+        c_ddf.DDF_VDCR_RAID5, c_ddf.DDF_VDCR_RAID5_N_RESTART, None, Level.RAID5, Layout.LEFT_ASYMMETRIC
+    ),
+    (c_ddf.DDF_VDCR_RAID5, c_ddf.DDF_VDCR_RAID5_0_RESTART): _LayoutContract(
+        c_ddf.DDF_VDCR_RAID5, c_ddf.DDF_VDCR_RAID5_0_RESTART, None, Level.RAID5, Layout.RIGHT_ASYMMETRIC
+    ),
+    (c_ddf.DDF_VDCR_RAID5, c_ddf.DDF_VDCR_RAID5_N_CONTINUE): _LayoutContract(
+        c_ddf.DDF_VDCR_RAID5, c_ddf.DDF_VDCR_RAID5_N_CONTINUE, None, Level.RAID5, Layout.LEFT_SYMMETRIC
+    ),
+    (c_ddf.DDF_VDCR_RAID6, c_ddf.DDF_VDCR_RAID5_N_RESTART): _LayoutContract(
+        c_ddf.DDF_VDCR_RAID6, c_ddf.DDF_VDCR_RAID5_N_RESTART, None, Level.RAID6, Layout.ROTATING_N_RESTART
+    ),
+    (c_ddf.DDF_VDCR_RAID6, c_ddf.DDF_VDCR_RAID6_0_RESTART): _LayoutContract(
+        c_ddf.DDF_VDCR_RAID6, c_ddf.DDF_VDCR_RAID6_0_RESTART, None, Level.RAID6, Layout.ROTATING_ZERO_RESTART
+    ),
+    (c_ddf.DDF_VDCR_RAID6, c_ddf.DDF_VDCR_RAID5_N_CONTINUE): _LayoutContract(
+        c_ddf.DDF_VDCR_RAID6, c_ddf.DDF_VDCR_RAID5_N_CONTINUE, None, Level.RAID6, Layout.ROTATING_N_CONTINUE
+    ),
+}
+
+
+# Contracts for nested virtual disks (Secondary Element Count > 1). Only primary RAID1 with a striped
+# or spanned secondary level is a nested layout the generic engine can reconstruct.
+_NESTED_LAYOUT_CONTRACTS: dict[tuple[int, int, int], _LayoutContract] = {
+    (c_ddf.DDF_VDCR_RAID1, c_ddf.DDF_VDCR_RAID1_SIMPLE, c_ddf.DDF_VDCR_2STRIPED): _LayoutContract(
+        c_ddf.DDF_VDCR_RAID1, c_ddf.DDF_VDCR_RAID1_SIMPLE, 2, Level.RAID10, RAID10_LAYOUT_NEAR2
+    ),
+    (c_ddf.DDF_VDCR_RAID1, c_ddf.DDF_VDCR_RAID1_SIMPLE, c_ddf.DDF_VDCR_2SPANNED): _LayoutContract(
+        c_ddf.DDF_VDCR_RAID1, c_ddf.DDF_VDCR_RAID1_SIMPLE, 2, Level.RAID10, RAID10_LAYOUT_NEAR2
+    ),
+    (c_ddf.DDF_VDCR_RAID1, c_ddf.DDF_VDCR_RAID1_MULTI, c_ddf.DDF_VDCR_2STRIPED): _LayoutContract(
+        c_ddf.DDF_VDCR_RAID1, c_ddf.DDF_VDCR_RAID1_MULTI, 3, Level.RAID10, RAID10_LAYOUT_NEAR3
+    ),
+    (c_ddf.DDF_VDCR_RAID1, c_ddf.DDF_VDCR_RAID1_MULTI, c_ddf.DDF_VDCR_2SPANNED): _LayoutContract(
+        c_ddf.DDF_VDCR_RAID1, c_ddf.DDF_VDCR_RAID1_MULTI, 3, Level.RAID10, RAID10_LAYOUT_NEAR3
+    ),
+}
+
+
+def _raise_layout_error(
+    message: str,
+    prl: int,
+    rlq: int,
+    srl: int,
+    pec: int,
+    sec: int,
+    ses: int | None = None,
+) -> None:
+    """Raise a :class:`DDFLayoutError` while preserving the raw on-disk layout fields for later review."""
+    raise DDFLayoutError(
+        f"{message} "
+        f"(primary_raid_level={prl:#04x}, raid_level_qualifier={rlq:#04x}, secondary_raid_level={srl:#04x}, "
+        f"primary_element_count={pec}, secondary_element_count={sec}, secondary_element_seq={ses})",
+        primary_raid_level=prl,
+        raid_level_qualifier=rlq,
+        secondary_raid_level=srl,
+        primary_element_count=pec,
+        secondary_element_count=sec,
+        secondary_element_seq=ses,
+    )
+
+
+def _convert_raid_layout(
+    prl: int, rlq: int, srl: int, pec: int, sec: int, ses: int | None = None
+) -> tuple[Level, Layout | int | None, int]:
+    """Convert DDF RAID layout fields to a generic RAID engine level, layout and disk count.
+
+    The combination is fully validated against :data:`_SINGLE_LAYOUT_CONTRACTS` and
+    :data:`_NESTED_LAYOUT_CONTRACTS` before anything is read from the virtual disk, so unsupported and
+    self-contradictory configurations fail with the original layout fields attached to the exception.
 
     Args:
         prl: The DDF Primary RAID Level.
         rlq: The DDF RAID Level Qualifier.
         srl: The DDF Secondary RAID Level.
-        pec: The DDF Primary Element Count
+        pec: The DDF Primary Element Count.
         sec: The DDF Secondary Element Count.
+        ses: The DDF Secondary Element Seq, used only for forensics on error.
     """
-    level = None
-    layout = None
-    num_disks = pec
+    if pec < 1:
+        _raise_layout_error(f"Invalid primary element count: {pec}", prl, rlq, srl, pec, sec, ses)
+
+    if sec < 1:
+        _raise_layout_error(f"Invalid secondary element count: {sec}", prl, rlq, srl, pec, sec, ses)
 
     if sec > 1:
-        if prl != c_ddf.DDF_VDCR_RAID1 or srl not in (c_ddf.DDF_VDCR_2STRIPED, c_ddf.DDF_VDCR_2SPANNED):
-            raise ValueError(f"Unsupported secondary RAID level: {srl}")
+        contract = _NESTED_LAYOUT_CONTRACTS.get((prl, rlq, srl))
+        if contract is None:
+            _raise_layout_error(
+                "Unsupported or contradictory nested DDF RAID layout", prl, rlq, srl, pec, sec, ses
+            )
+        if contract.primary_element_count is not None and pec != contract.primary_element_count:
+            _raise_layout_error(
+                "DDF RAID level qualifier does not match the primary element count",
+                prl,
+                rlq,
+                srl,
+                pec,
+                sec,
+                ses,
+            )
 
-        if num_disks == 2 and rlq == c_ddf.DDF_VDCR_RAID1_SIMPLE:
-            layout = 0x102  # 2 near copies, 1 far copy
-        elif num_disks == 3 and rlq == c_ddf.DDF_VDCR_RAID1_MULTI:
-            layout = 0x103  # 3 near copies, 1 far copy
+        return contract.level, contract.layout, pec * sec
 
-        num_disks *= sec
-        level = Level.RAID10
+    if srl != DDF_VDCR_NO_SECONDARY:
+        _raise_layout_error(
+            "Secondary RAID level is set while the secondary element count is 1",
+            prl,
+            rlq,
+            srl,
+            pec,
+            sec,
+            ses,
+        )
 
-    else:
-        if prl == c_ddf.DDF_VDCR_CONCAT:
-            level = Level.LINEAR
+    contract = _SINGLE_LAYOUT_CONTRACTS.get((prl, rlq)) or _SINGLE_LAYOUT_CONTRACTS.get((prl, _ANY_QUALIFIER))
+    if contract is None:
+        _raise_layout_error("Unsupported or contradictory DDF RAID layout", prl, rlq, srl, pec, sec, ses)
 
-        elif prl == c_ddf.DDF_VDCR_RAID0:
-            if rlq != c_ddf.DDF_VDCR_RAID0_SIMPLE:
-                raise ValueError(f"Unsupported DDF RAID0 layout: ({prl}, {rlq})")
+    if contract.primary_element_count is not None and pec != contract.primary_element_count:
+        _raise_layout_error(
+            "DDF RAID level qualifier does not match the primary element count", prl, rlq, srl, pec, sec, ses
+        )
 
-            level = Level.RAID0
-
-        elif prl == c_ddf.DDF_VDCR_RAID1:
-            if not (
-                (rlq == c_ddf.DDF_VDCR_RAID1_SIMPLE and num_disks == 2)
-                or (rlq == c_ddf.DDF_VDCR_RAID1_MULTI and num_disks == 3)
-            ):
-                raise ValueError(f"Unsupported DDF RAID1 layout: ({prl}, {rlq})")
-
-            level = Level.RAID1
-
-        elif prl == c_ddf.DDF_VDCR_RAID1E:
-            if rlq == c_ddf.DDF_VDCR_RAID1E_ADJACENT:
-                layout = 0x102
-            elif rlq == c_ddf.DDF_VDCR_RAID1E_OFFSET:
-                layout = 0x201
-            else:
-                raise ValueError(f"Unsupported DDF RAID1E layout: ({prl}, {rlq})")
-
-            level = Level.RAID10
-
-        elif prl == c_ddf.DDF_VDCR_RAID4:
-            if rlq != c_ddf.DDF_VDCR_RAID4_N:
-                raise ValueError(f"Unsupported DDF RAID4 layout: ({prl}, {rlq})")
-
-            level = Level.RAID4
-
-        elif prl == c_ddf.DDF_VDCR_RAID5:
-            if rlq == c_ddf.DDF_VDCR_RAID5_N_RESTART:
-                layout = Layout.LEFT_ASYMMETRIC
-            elif rlq == c_ddf.DDF_VDCR_RAID5_0_RESTART:
-                layout = Layout.RIGHT_ASYMMETRIC
-            elif rlq == c_ddf.DDF_VDCR_RAID5_N_CONTINUE:
-                layout = Layout.LEFT_SYMMETRIC
-            else:
-                raise ValueError(f"Unsupported DDF RAID5 layout: ({prl}, {rlq})")
-
-            level = Level.RAID5
-
-        elif prl == c_ddf.DDF_VDCR_RAID6:
-            if rlq == c_ddf.DDF_VDCR_RAID5_N_RESTART:
-                layout = Layout.ROTATING_N_RESTART
-            elif rlq == c_ddf.DDF_VDCR_RAID6_0_RESTART:
-                layout = Layout.ROTATING_ZERO_RESTART
-            elif rlq == c_ddf.DDF_VDCR_RAID5_N_CONTINUE:
-                layout = Layout.ROTATING_N_CONTINUE
-            else:
-                raise ValueError(f"Unsupported DDF RAID6 layout: ({prl}, {rlq})")
-
-            level = Level.RAID6
-        else:
-            raise ValueError(f"Unsupported DDF RAID layout: ({prl}, {rlq})")
-
-    return level, layout, num_disks
+    return contract.level, contract.layout, pec
