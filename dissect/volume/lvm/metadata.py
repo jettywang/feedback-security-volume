@@ -87,8 +87,11 @@ class VolumeGroup(MetaBase):
         return list(self.logical_volumes.values())
 
     def attach(self, devices: dict[str, LVM2Device]) -> None:
+        # PV UUIDs inside the text metadata are dash-separated while the on-disk PV header stores them without
+        # dashes. Normalize both sides so attachment never depends on the formatting of either identifier.
+        normalized = {pv_id.replace("-", ""): device for pv_id, device in devices.items()}
         for pv in self.physical_volumes.values():
-            pv._dev = devices.get(pv.id.replace("-", ""))
+            pv._dev = normalized.get(pv.id.replace("-", ""))
 
     def _from_dict(self, obj: dict, name: str | None = None, parent: MetaBase | None = None) -> None:
         super()._from_dict(obj, name=name, parent=parent)
