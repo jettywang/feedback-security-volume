@@ -6,12 +6,10 @@ from __future__ import annotations
 import io
 import logging
 import os
-from collections import defaultdict
 from functools import cached_property
-from typing import TYPE_CHECKING, BinaryIO, TypedDict, TypeVar
+from typing import TYPE_CHECKING, BinaryIO
 
 from dissect.util import ts
-
 from dissect.volume.raid.raid import (
     RAID,
     Configuration,
@@ -22,9 +20,8 @@ from dissect.volume.raid.stream import Layout, Level
 from dissect.volume.vinum.c_vinum import MAGIC_ACTIVE, MAGIC_INACTIVE, c_vinum
 from dissect.volume.vinum.config import (
     PlexOrg,
-    PlexState,
-    SDState,
-    parse_vinum_config,
+    analyze_vinum_configs,
+    parse_vinum_config_with_issues,
 )
 
 if TYPE_CHECKING:
@@ -69,28 +66,20 @@ class Vinum(RAID):
         fhs = [fh] if not isinstance(fh, list) else fh
         physical_disks = [VinumPhysicalDisk(fh) if not isinstance(fh, VinumPhysicalDisk) else fh for fh in fhs]
 
-        super().__init__([VinumConfiguration(physical_disks)])
+        configuration = VinumConfiguration(physical_disks)
+        self.diagnostics = configuration.diagnostics
+
+        super().__init__([configuration])
 
 
-T = TypeVar("T")
-ByName = dict[bytes, T]
-DefaultByName = defaultdict[bytes, T]
-
-
-class Config(TypedDict):
-    """Configuration."""
-
-    volumes: ByName[Volume]
-    plexes: ByName[Plex]
-    sds: ByName[SD]
+ByName = dict[bytes, "VinumPhysicalDisk"]
 
 
 class VinumConfiguration(Configuration):
     def __init__(self, physical_disks: list[VinumPhysicalDisk]):
-        # These hold the most recent config for each volume/plex/sd
-        config: Config = {"volumes": {}, "plexes": {}, "sds": {}}
-        disks_by_name: ByName[VinumPhysicalDisk] = {}
+        disks_by_name: ByName = {}
 
+        parsed_configs = []
         # Find the most recent configuration for each Volume/Plex/SD by merging
         # all configs from all physical disks.
         for disk in physical_disks:
@@ -114,106 +103,48 @@ class VinumConfiguration(Configuration):
             # Plexes with a non-existing Volume and SDs with a non-existing Plex or
             # Drive (VinumPhysicalDisk) can not be used. They result in an error in
             # the FreeBSD kernel code.
-            config_data = parse_vinum_config(disk.config_time, disk.config)
+            parsed_configs.append(parse_vinum_config_with_issues(disk.config_time, disk.config, disk=disk.id))
 
-            for config_type, new_items in config_data.items():
-                cur_config = config[config_type]
+        # Check the configuration graph before building any virtual disk. The
+        # analyzer only reads the parsed objects, the original config buffers
+        # stay untouched.
+        self.diagnostics = analyze_vinum_configs(parsed_configs, drives=disks_by_name.keys())
+        for issue in self.diagnostics.issues:
+            log.warning("%s", issue)
 
-                for new_item in new_items:
-                    if cur_item := cur_config.get(new_item.name):
-                        if new_item.timestamp > cur_item.timestamp:
-                            cur_config[new_item.name] = new_item
-                    else:
-                        cur_config[new_item.name] = new_item
+        for assessment in self.diagnostics.volumes:
+            if not assessment.readable:
+                log.warning(
+                    "Volume %r is not readable, keeping configuration evidence: %s",
+                    assessment.name,
+                    assessment.reason,
+                )
 
-        # plexes_by_name contains all *active* plexes
-        plexes_by_name: ByName[Plex] = {}
-
-        # plexes_by_volume contains all *active* plexes grouped by the name of
-        # the volume they belong to
-        plexes_by_volume: DefaultByName[list[Plex]] = defaultdict(list)
-        # sds_by_plex_by_volume contains all sds for all *active* plexes
-        # grouped by plex and volume name
-        sds_by_plex_by_volume: DefaultByName[DefaultByName[list[SD]]] = defaultdict(lambda: defaultdict(list))
-
-        # Check whether the found plexes are viable and filter them out if they
-        # are not.
-        # Note that if a complete Volume is down, we still try to use it (we don't check on Volume.state).
-        for plex in config["plexes"].values():
-            if config["volumes"].get(plex.volume):
-                # A plex in the DOWN state is probably not fit to use
-                if plex.state != PlexState.DOWN:
-                    if plex.org != PlexOrg.DISORG:
-                        plexes_by_name[plex.name] = plex
-                        plexes_by_volume[plex.volume].append(plex)
-                    else:
-                        log.warning("Plex %r has an unknown organisation, ignoring plex", plex.name)
-                else:
-                    log.warning("Plex %r is down, ignoring plex", plex.name)
-            else:
-                log.warning("Unknown volume %r for plex %r, ignoring plex", plex.volume, plex.name)
-
-        # Check whether the found sds are viable and filter them out if they
-        # are not.
-        for sd in config["sds"].values():
-            if plex := plexes_by_name.get(sd.plex):
-                sds_by_plex_by_volume[plex.volume][sd.plex].append(sd)
-            else:
-                log.warning("Unknown or inactive plex %r for sd %r, ignoring sd", sd.plex, sd.name)
-
-        # The construction of the disk_map assumes the configuration
-        # information is complete and no sd configs are missing.
-        # Note that there are no checks done on the completeness of the sd
-        # values, these can theoretically be None due to a corrupt
-        # configuration.
-        disk_map_by_plex_by_volume: DefaultByName[DefaultByName[list[SD]]] = defaultdict(lambda: defaultdict(list))
-        for volume_id, sds_by_plex in sds_by_plex_by_volume.items():
-            for plex_id, sds in sds_by_plex.items():
-                sds = sorted(sds, key=lambda sd: sd.plexoffset)
-                disk_map = {}
-                for idx, sd in enumerate(sds):
-                    if (
-                        sd.state != SDState.DOWN and sd.state != SDState.DEGRADED and sd.state != SDState.INITIALIZING
-                    ):  # sd's in these states are probably not fit to use
-                        if sd.drive in disks_by_name:
-                            disk_map[idx] = (0, disks_by_name[sd.drive])
-                        else:
-                            log.warning("Physical disk %r for sd %r is missing, ignoring sd", sd.drive, sd.name)
-                    else:
-                        log.warning("SD %r is not in a usable state: %r, ignoring sd", sd.name, sd.state)
-                if disk_map:
-                    disk_map_by_plex_by_volume[volume_id][plex_id] = disk_map
-
-        # Each volume represents a separate virtual disk
+        # Each readable volume represents a separate virtual disk
         virtual_disks = []
-        for volume_id, plexes in plexes_by_volume.items():
-            volume = config["volumes"][volume_id]
-            if plexes:
-                # Special case if there is only 1 plex (no mirroring)
-                if len(plexes) == 1:
-                    plex = plexes[0]
-                    disk_map = disk_map_by_plex_by_volume[volume.name][plex.name]
-                    if disk_map:
-                        sds = sds_by_plex_by_volume[volume.name][plex.name]
-                        virtual_disks.append(VinumPlexDisk(volume, plex, sds, disk_map))
-                else:
-                    plex_map = {}
-                    # There is no official order in the plexes. However if they
-                    # are named automatically, they have a pseudo order due to
-                    # there names being constructed with p0, p1, etc.
-                    splexes = sorted(plexes, key=lambda plex: plex.name)
-                    for idx, plex in enumerate(splexes):
-                        disk_map = disk_map_by_plex_by_volume[volume.name][plex.name]
-                        if disk_map:
-                            sds = sds_by_plex_by_volume[volume.name][plex.name]
-                            plex_disk = VinumPlexDisk(volume, plex, sds, disk_map)
-                            plex_map[idx] = (0, plex_disk)
+        for assessment in self.diagnostics.volumes:
+            if not assessment.readable:
+                continue
 
-                    if plex_map:
-                        virtual_disks.append(VinumMirrorDisk(volume, plexes, plex_map))
+            volume = assessment.volume
+            plexes = assessment.plexes
+            sds_by_plex = assessment.sds
 
+            if len(plexes) == 1:
+                plex = plexes[0]
+                sds = sds_by_plex[plex.name]
+                virtual_disks.append(VinumPlexDisk(volume, plex, sds, build_disk_map(sds, disks_by_name)))
             else:
-                log.warning("Volume %r has no or only inactive plexes, ignoring volume", volume.name)
+                plex_map = {}
+                # There is no official order in the plexes. However if they
+                # are named automatically, they have a pseudo order due to
+                # there names being constructed with p0, p1, etc.
+                splexes = sorted(plexes, key=lambda plex: plex.name)
+                for idx, plex in enumerate(splexes):
+                    sds = sds_by_plex[plex.name]
+                    plex_map[idx] = (0, VinumPlexDisk(volume, plex, sds, build_disk_map(sds, disks_by_name)))
+
+                virtual_disks.append(VinumMirrorDisk(volume, plexes, plex_map))
 
         if not virtual_disks:
             raise ValueError(
@@ -221,6 +152,14 @@ class VinumConfiguration(Configuration):
             )
 
         super().__init__(physical_disks, virtual_disks)
+
+
+def build_disk_map(sds: list[SD], disks_by_name: ByName[VinumPhysicalDisk]) -> DiskMap:
+    """Build a disk map for the given, already validated, SDs."""
+    disk_map: DiskMap = {}
+    for idx, sd in enumerate(sorted(sds, key=lambda sd: sd.plexoffset)):
+        disk_map[idx] = (0, disks_by_name[sd.drive])
+    return disk_map
 
 
 org_to_level = {
