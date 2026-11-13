@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from typing import TYPE_CHECKING, BinaryIO
 
 from dissect.cstruct import cstruct
@@ -8,7 +9,7 @@ from dissect.volume.disk.partition import Partition
 from dissect.volume.exceptions import DiskError
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Generator, Iterator
 
 mbr_def = """
 typedef struct part_s {
@@ -33,6 +34,8 @@ typedef struct mbr_s {
 
 c_mbr = cstruct().load(mbr_def)
 
+EXTENDED_PARTITION_TYPES = (0x05, 0x0F, 0x85)
+
 
 class MBR:
     """Master Boot Record."""
@@ -56,34 +59,104 @@ class MBR:
 
         self.partitions: list[Partition] = list(self._partitions(self.mbr, self.offset))
 
-    def _partitions(
-        self, mbr: c_mbr.mbr_s, offset: int, num_start: int = 0, ebr_offset: int | None = None
-    ) -> Iterator[Partition]:
-        for num, partition in enumerate(mbr.part):
+    def _partitions(self, mbr: c_mbr.mbr_s, offset: int, num_start: int = 0) -> Iterator[Partition]:
+        # `offset` is the absolute start of `mbr` in the stream. For the primary MBR
+        # this is the start of the disk, which is not necessarily 0. Each extended
+        # partition entry in the primary MBR defines its own container with its own EBR
+        # chain; all partitions are numbered sequentially in the order they are found.
+        number = num_start + 1
+
+        for partition in mbr.part:
             if partition.type == 0x00:
                 continue
 
-            part_offset = offset + partition.sector_ofs * self.sector_size
-
-            if partition.type in (0x05, 0x0F, 0x85):  # Extended
-                if not ebr_offset:
-                    ebr_offset = part_offset
-                else:
-                    # Chained extended MBRs are relative to the first one
-                    part_offset = ebr_offset + partition.sector_ofs * self.sector_size
-
-                self.fh.seek(part_offset)
-                e_mbr = c_mbr.mbr_s(self.fh)
-                yield from self._partitions(e_mbr, part_offset, num_start + num, ebr_offset=ebr_offset)
-
+            if partition.type in EXTENDED_PARTITION_TYPES:
+                # The first EBR is at the start of the extended container. The size of
+                # the extended partition entry is the size of the container.
+                container_start = offset + partition.sector_ofs * self.sector_size
+                container_size = partition.sector_size * self.sector_size
+                number = yield from self._extended_partitions(
+                    container_start=container_start,
+                    first_ebr=container_start,
+                    container_size=container_size,
+                    number=number,
+                )
                 continue
 
             yield Partition(
                 disk=self,
-                number=num_start + num + 1,  # partitions are 1-indexed
-                offset=part_offset,
+                number=number,
+                offset=offset + partition.sector_ofs * self.sector_size,
                 size=partition.sector_size * self.sector_size,
                 type=partition.type,
                 flags=partition.bootable,
                 raw=partition,
             )
+            number += 1
+
+    def _extended_partitions(
+        self, container_start: int, first_ebr: int, container_size: int, number: int
+    ) -> Generator[Partition, None, int]:
+        """Walk a single extended partition chain.
+
+        ``container_start`` and ``container_size`` describe the extended partition
+        container. ``first_ebr`` is the absolute address of the first EBR of the chain.
+        Logical partitions are relative to the *current* EBR, while the link to the next
+        EBR is relative to the *first* EBR. These are distinct address bases and must
+        not be mixed. Both the current EBR and every logical partition have to stay
+        within the container. Revisiting an EBR address ends the walk, so self-referencing
+        or looping chains terminate without a fixed recursion limit.
+
+        Yields the logical partitions and returns the next unused partition number.
+        """
+        container_end = container_start + container_size
+        visited: set[int] = set()
+        pending = deque([first_ebr])
+
+        while pending:
+            current_ebr = pending.popleft()
+
+            if current_ebr in visited or not container_start <= current_ebr < container_end:
+                continue
+            visited.add(current_ebr)
+
+            try:
+                ebr = self._read_ebr(current_ebr)
+            except (EOFError, OSError, ValueError):
+                continue
+
+            for partition in ebr.part:
+                if partition.type == 0x00:
+                    continue
+
+                if partition.type in EXTENDED_PARTITION_TYPES:
+                    # The next EBR is relative to the first EBR, not to the current one
+                    next_ebr = first_ebr + partition.sector_ofs * self.sector_size
+                    if next_ebr not in visited and container_start <= next_ebr < container_end:
+                        pending.append(next_ebr)
+                    continue
+
+                # Logical partitions are relative to the current EBR
+                part_offset = current_ebr + partition.sector_ofs * self.sector_size
+                size = partition.sector_size * self.sector_size
+
+                # Never surface data that falls outside the extended partition container
+                if not container_start <= part_offset < container_end or part_offset + size > container_end:
+                    continue
+
+                yield Partition(
+                    disk=self,
+                    number=number,
+                    offset=part_offset,
+                    size=size,
+                    type=partition.type,
+                    flags=partition.bootable,
+                    raw=partition,
+                )
+                number += 1
+
+        return number
+
+    def _read_ebr(self, offset: int) -> c_mbr.mbr_s:
+        self.fh.seek(offset)
+        return c_mbr.mbr_s(self.fh)
