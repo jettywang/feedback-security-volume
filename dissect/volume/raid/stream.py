@@ -4,11 +4,28 @@ from enum import IntEnum
 from typing import TYPE_CHECKING, NamedTuple
 
 from dissect.util.stream import AlignedStream, MappingStream
-
-from dissect.volume.exceptions import RAIDError
+from dissect.volume.exceptions import RAIDError, RAIDStripeReadError
 
 if TYPE_CHECKING:
     from dissect.volume.raid.raid import DiskMap, PhysicalDisk, VirtualDisk
+
+
+class MemberEvidence(NamedTuple):
+    """Forensic evidence for a single member involved in a failed stripe read.
+
+    Args:
+        disk_idx: The RAID device index of the member (its position in the virtual disk map).
+        reason: Why the member could not supply its stripe chunk.
+        member_offset: The byte offset on the physical member where the chunk should have been read.
+        expected_length: The number of bytes expected from the member.
+        actual_length: The number of bytes actually returned, or ``None`` if no read was possible.
+    """
+
+    disk_idx: int
+    reason: str
+    member_offset: int
+    expected_length: int
+    actual_length: int | None
 
 
 class Level(IntEnum):
@@ -182,7 +199,16 @@ class RAID0Stream(AlignedStream):
 
 
 class RAID456Stream(AlignedStream):
-    """Implements a stream on a RAID5 set."""
+    """Implements a read-only stream on a RAID4/5/6 set, including degraded recovery.
+
+    A RAID4/5 set can be opened with a single member missing: the missing data chunks are rebuilt
+    from the P parity stripe (XOR of the surviving members). Every logical byte that is the result
+    of such a rebuild is recorded in :attr:`reconstructed_ranges` and :meth:`reconstructed_bitmap`.
+
+    A second failed member, or a member that returns a short read, is never padded with zero bytes.
+    Instead a :class:`~dissect.volume.exceptions.RAIDStripeReadError` is raised carrying
+    per-member :class:`MemberEvidence` for the failed interval.
+    """
 
     def __init__(self, virtual_disk: VirtualDisk):
         self.virtual_disk = virtual_disk
@@ -191,12 +217,185 @@ class RAID456Stream(AlignedStream):
         self.max_degraded = 2 if self.level == 6 else 1
 
         self.disk_map = self.virtual_disk.disk_map
-        if len(self.disk_map) < self.virtual_disk.num_disks - self.max_degraded:
+        missing = self.virtual_disk.num_disks - len(self.disk_map)
+        if missing > self.max_degraded:
             raise RAIDError(f"Missing disks in RAID{self.level} set {virtual_disk.uuid} ({virtual_disk.name})")
+
+        # Logical (virtual volume) byte ranges that could only be produced through reconstruction.
+        self.reconstructed_ranges: list[tuple[int, int]] = []
 
         super().__init__(self.virtual_disk.size, self.virtual_disk.stripe_size)
 
-    def _get_stripe_read_info(self, offset: int) -> tuple[int, int, int, int, int | None]:
+    def is_reconstructed(self, offset: int, length: int) -> bool:
+        """Return whether every byte in the logical range ``[offset, offset + length)`` was rebuilt."""
+        if length <= 0:
+            return False
+        end = offset + length
+        covered = offset
+        for range_start, range_end in self.reconstructed_ranges:
+            if range_end <= covered or range_start > covered:
+                if range_start >= end:
+                    break
+                continue
+            covered = max(covered, min(range_end, end))
+            if covered >= end:
+                return True
+        return False
+
+    def reconstructed_bitmap(self, offset: int, length: int) -> bytearray:
+        """Return a per-byte bitmap (1 = reconstructed, 0 = read directly) for a logical range."""
+        end = offset + length
+        bitmap = bytearray(length)
+        for range_start, range_end in self.reconstructed_ranges:
+            if range_end <= offset:
+                continue
+            if range_start >= end:
+                break
+            overlap_start = max(range_start, offset) - offset
+            overlap_end = min(range_end, end) - offset
+            bitmap[overlap_start:overlap_end] = b"\x01" * (overlap_end - overlap_start)
+        return bitmap
+
+    def _record_reconstructed(self, offset: int, length: int) -> None:
+        """Record a logical byte range as reconstructed, merging it with adjacent ranges."""
+        if length <= 0:
+            return
+        start, end = offset, offset + length
+        if self.reconstructed_ranges and self.reconstructed_ranges[-1][1] == start:
+            previous_start, _ = self.reconstructed_ranges[-1]
+            self.reconstructed_ranges[-1] = (previous_start, end)
+        else:
+            self.reconstructed_ranges.append((start, end))
+
+    def _read_member(self, disk_idx: int, member_offset: int, length: int, stripe_number: int = -1) -> bytes:
+        """Read a chunk from a single member, turning any failure into forensic evidence.
+
+        A missing member or a short read raises :class:`RAIDStripeReadError` instead of returning a
+        zero-padded buffer, so a degraded read can never be mistaken for complete data.
+        """
+        entry = self.disk_map.get(disk_idx)
+        if entry is None:
+            evidence = [MemberEvidence(disk_idx, "member missing", member_offset, length, None)]
+            raise RAIDStripeReadError(
+                f"Required member disk {disk_idx} is missing from the RAID{self.level} set",
+                evidence,
+                member_offset,
+                length,
+                stripe_number,
+            )
+
+        dev_start, device = entry
+        offset_on_disk = device.offset + dev_start + member_offset
+        device.fh.seek(offset_on_disk)
+        data = device.fh.read(length)
+        if len(data) != length:
+            evidence = [
+                MemberEvidence(
+                    disk_idx,
+                    f"short read: expected {length} bytes, got {len(data)}",
+                    offset_on_disk,
+                    length,
+                    len(data),
+                )
+            ]
+            raise RAIDStripeReadError(
+                f"Short read on member disk {disk_idx}: expected {length} bytes at {offset_on_disk:#x}, "
+                f"got {len(data)}",
+                evidence,
+                member_offset,
+                length,
+                stripe_number,
+            )
+        return data
+
+    def _rebuild_stripe(
+        self,
+        stripe: int,
+        member_offset: int,
+        chunk_length: int,
+        logical_offset: int,
+        logical_length: int,
+    ) -> tuple[bytes, list[MemberEvidence]]:
+        """Rebuild one missing chunk of a RAID4/5 stripe by XOR-ing every surviving member.
+
+        RAID4/5 P parity is the XOR of *all* chunks in a stripe, so the missing chunk - data or
+        parity - equals the XOR of every surviving member, the parity member included. Returns the
+        rebuilt chunk together with any member evidence gathered while reading the survivors.
+        Raises :class:`RAIDStripeReadError` if more than one member is unusable.
+        """
+        raid_disks = self.virtual_disk.num_disks
+        rebuilt = 0
+        evidence: list[MemberEvidence] = []
+        surviving = 0
+
+        for disk_idx in range(raid_disks):
+            entry = self.disk_map.get(disk_idx)
+            if entry is None:
+                evidence.append(MemberEvidence(disk_idx, "member missing", member_offset, chunk_length, None))
+                continue
+            try:
+                chunk = self._read_member(disk_idx, member_offset, chunk_length, stripe)
+            except RAIDStripeReadError as err:
+                evidence.extend(err.evidence)
+                continue
+            surviving += 1
+            rebuilt ^= int.from_bytes(chunk, "big")
+
+        required_survivors = raid_disks - 2
+        if surviving < required_survivors or len(evidence) > 1:
+            raise RAIDStripeReadError(
+                f"Cannot rebuild stripe {stripe} of RAID{self.level} set: {len(evidence)} member(s) unusable, "
+                f"a single failure is the maximum that P parity can recover",
+                evidence,
+                logical_offset,
+                logical_length,
+                stripe,
+            )
+
+        return rebuilt.to_bytes(chunk_length, "big"), evidence
+
+    def _read(self, offset: int, length: int) -> bytes:
+        result = []
+
+        stripe_size = self.virtual_disk.stripe_size
+        while length:
+            stripe, offset_in_stripe, dd_idx, _, _, _ = self._get_stripe_read_info(offset)
+            offset_in_device = stripe * stripe_size + offset_in_stripe
+
+            stripe_remaining = stripe_size - offset_in_stripe
+            read_length = min(length, stripe_remaining)
+
+            if dd_idx in self.disk_map:
+                # The requested data member is present, read it directly.
+                data = self._read_member(dd_idx, offset_in_device, read_length, stripe)
+            else:
+                # The data member is missing. RAID4/5 can rebuild it from the P parity stripe.
+                if self.level not in (Level.RAID4, Level.RAID5):
+                    raise RAIDStripeReadError(
+                        f"Degraded reconstruction of RAID{self.level} is not supported",
+                        [MemberEvidence(dd_idx, "member missing", offset_in_device, read_length, None)],
+                        offset,
+                        read_length,
+                        stripe,
+                    )
+                data, _ = self._rebuild_stripe(
+                    stripe,
+                    stripe * stripe_size,
+                    stripe_size,
+                    offset,
+                    read_length,
+                )
+                data = data[offset_in_stripe : offset_in_stripe + read_length]
+                self._record_reconstructed(offset, read_length)
+
+            result.append(data)
+
+            length -= read_length
+            offset += read_length
+
+        return b"".join(result)
+
+    def _get_stripe_read_info(self, offset: int) -> tuple[int, int, int, int, int | None, bool]:
         """Calculate the stripe, offset in the stripe, data disk, parity disk and "Q" parity disk for a given sector."""
         # Reference: raid5_compute_sector
         stripe_size = self.virtual_disk.stripe_size
@@ -351,27 +550,6 @@ class RAID456Stream(AlignedStream):
             raise RAIDError(f"Invalid RAID level: {self.level}")
 
         return stripe, offset_in_stripe, dd_idx, pd_idx, qd_idx, ddf_layout
-
-    def _read(self, offset: int, length: int) -> bytes:
-        result = []
-
-        stripe_size = self.virtual_disk.stripe_size
-        while length:
-            stripe, offset_in_stripe, dd_idx, _, _, _ = self._get_stripe_read_info(offset)
-            offset_in_device = stripe * stripe_size + offset_in_stripe
-            dd_start, dd_dev = self.disk_map[dd_idx]
-
-            stripe_remaining = stripe_size - offset_in_stripe
-            read_length = min(length, stripe_remaining)
-
-            offset_on_disk = dd_dev.offset + dd_start + offset_in_device
-            dd_dev.fh.seek(offset_on_disk)
-            result.append(dd_dev.fh.read(length))
-
-            length -= read_length
-            offset += read_length
-
-        return b"".join(result)
 
 
 class RAID10Stream(AlignedStream):
