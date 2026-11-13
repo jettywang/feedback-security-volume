@@ -70,7 +70,13 @@ class Disk:
             for scheme in [APM, BSD]:
                 try:
                     self.fh.seek(0)
-                    self.scheme = scheme(self.fh, sector_size=self.sector_size)
+                    # APM can derive the block size from its Driver Descriptor Record when the caller
+                    # did not provide one, so pass the original value (possibly None) rather than the
+                    # 512-byte fallback.
+                    scheme_sector_size = sector_size if scheme is APM else self.sector_size
+                    self.scheme = scheme(self.fh, sector_size=scheme_sector_size)
+                    if isinstance(self.scheme, APM):
+                        self.sector_size = self.scheme.sector_size
                     break
                 except Exception as e:
                     errors.append(str(e))
