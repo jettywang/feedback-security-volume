@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
 from functools import lru_cache
 from typing import BinaryIO
 
 from dissect.volume.dm.c_dm import SECTOR_SIZE, c_dm
+from dissect.volume.exceptions import DMError
 
 
 class BTree:
@@ -17,7 +19,30 @@ class BTree:
 
     def _read_node(self, block: int) -> Node:
         self.fh.seek(block * self._block_size_bytes)
-        return Node(self.fh.read(self._block_size_bytes))
+        buf = self.fh.read(self._block_size_bytes)
+        if len(buf) != self._block_size_bytes:
+            raise DMError(
+                f"Truncated btree node at block {block}: expected {self._block_size_bytes} bytes, got {len(buf)}"
+            )
+        return Node(buf)
+
+    def walk(self) -> Iterator[tuple[int, bytes]]:
+        """Yield every ``(key, value)`` leaf pair of this tree in key order.
+
+        Only the leaf level of a single tree is traversed. For a multi-level tree the caller is responsible for
+        descending into the subtrees referenced by the returned values.
+        """
+        yield from self._walk(self.root)
+
+    def _walk(self, block: int) -> Iterator[tuple[int, bytes]]:
+        node = self._read_node(block)
+        if node.is_internal:
+            for idx in range(node.num_entries):
+                child = int.from_bytes(node.value(idx), "little")
+                yield from self._walk(child)
+        elif node.is_leaf:
+            for idx in range(node.num_entries):
+                yield node.key(idx), node.value(idx)
 
     def lookup(self, keys: int | list[int], want_high: bool = False) -> bytes | None:
         keys = [keys] if not isinstance(keys, list) else keys
