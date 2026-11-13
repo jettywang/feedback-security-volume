@@ -14,6 +14,8 @@ from dissect.volume.exceptions import DiskError
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
+    from dissect.cstruct import Structure
+
 bsd_def = """
 /* The disk magic number */
 #define BSD_MAGIC           0x82564557
@@ -297,7 +299,15 @@ class BSD:
 
         # BSD disklabel is usually part of another partition scheme such as MBR or GPT.
         # The actual BSD disklabel info always starts at the second sector.
-        offset = fh.seek(sector_size, io.SEEK_CUR)
+        #
+        # All coordinates below are interpreted relative to the start of the provided stream
+        # (the whole disk when standalone, or a parent partition when nested). Therefore we must
+        # anchor to absolute position 0 of this stream, never to its current file position. Using
+        # SEEK_CUR here would double-count the caller's offset when the file handle is already
+        # positioned somewhere (e.g. a raw handle seek()'d to a parent partition instead of a
+        # zero-based RangeStream), silently reading the wrong bytes.
+        self.fh.seek(sector_size, io.SEEK_SET)
+        offset = sector_size
         data = fh.read(512)
         magic = c_bsd.uint32(data)
 
@@ -326,9 +336,29 @@ class BSD:
     def _partitions(self) -> Iterator[Partition]:
         table_offset = 0
         if self.type == 32:
-            # Get the table offset first
+            # 32 bit disklabel offsets are whole-disk sector numbers, not slice-relative.
+            # The raw (whole disk, slot BSD_PART_RAW) entry's p_offset holds the whole-disk sector
+            # at which this label's parent slice starts. We subtract it to turn every p_offset into
+            # a stream-relative offset. For a standalone disk it is 0, so the subtraction is a
+            # no-op and both views of the same label stay byte-for-byte identical.
             self.fh.seek(self._partitions_offset + (c_bsd.BSD_PART_RAW * len(c_bsd.partition)))
-            table_offset = c_bsd.partition(self.fh).p_offset
+            raw_partition = c_bsd.partition(self.fh)
+            table_offset = raw_partition.p_offset
+
+            if self._is_unresolvable_nested_label(raw_partition):
+                # The raw slot is empty (p_size == 0 and p_offset == 0) so there is no parent-slice
+                # base to subtract, yet the other entries use absolute whole-disk sector numbers.
+                # A standalone disk with an empty raw slot is fine because its offsets are already
+                # slice-relative (small, starting near the boot area). When the offsets are clearly
+                # absolute the label must be nested; without the base we would emit coordinates that
+                # read outside the provided stream. Refuse instead of silently returning wrong bytes.
+                # Re-parse through a zero-based RangeStream of the parent and/or provide a label whose
+                # raw slot encodes the parent slice's whole-disk start sector.
+                raise DiskError(
+                    "Cannot resolve 32 bit BSD disklabel coordinates: the raw partition "
+                    f"(slot {c_bsd.BSD_PART_RAW}) is empty while partition offsets are absolute "
+                    "whole-disk sector numbers, so the parent-slice base is unknown."
+                )
 
         self.fh.seek(self._partitions_offset)
         for i in range(self.disklabel.d_npartitions):
@@ -370,3 +400,45 @@ class BSD:
                 type_str=FS_NAMES.get(partition.p_fstype, "?"),
                 raw=partition,
             )
+
+    def _is_unresolvable_nested_label(self, raw_partition: Structure) -> bool:
+        """Detect a 32 bit label whose coordinates cannot be rebased.
+
+        A 32 bit disklabel stores whole-disk sector numbers. The raw (whole disk) entry normally
+        carries the parent slice's start sector so the other offsets can be made slice-relative by
+        subtraction. When the raw slot is empty we only have a base of 0, which is correct for a
+        standalone disk but wrong for a nested label. We treat the label as unresolvable when the
+        raw slot is empty while a populated entry points past the end of the provided stream: that
+        combination can only be produced by absolute offsets that still need an unknown base.
+        """
+        if raw_partition.p_size != 0 or raw_partition.p_offset != 0:
+            return False
+
+        stream_size = self._stream_size()
+        for i in range(self.disklabel.d_npartitions):
+            if i == c_bsd.BSD_PART_RAW:
+                continue
+
+            self.fh.seek(self._partitions_offset + (i * len(c_bsd.partition)))
+            entry = c_bsd.partition(self.fh)
+            if entry.p_size == 0 or entry.p_fstype == 0:
+                continue
+
+            if stream_size is not None and entry.p_offset * self.sector_size >= stream_size:
+                return True
+
+        return False
+
+    def _stream_size(self) -> int | None:
+        """Best-effort size of the underlying stream, or None when it cannot be determined."""
+        stream = getattr(self.fh, "size", None)
+        if stream is not None:
+            return stream
+
+        try:
+            current = self.fh.tell()
+            end = self.fh.seek(0, io.SEEK_END)
+            self.fh.seek(current, io.SEEK_SET)
+            return end
+        except (OSError, ValueError):
+            return None
