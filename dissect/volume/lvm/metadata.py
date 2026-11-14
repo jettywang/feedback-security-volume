@@ -175,6 +175,27 @@ class PhysicalVolume(MetaBase):
         return stream
 
 
+@dataclass
+class LVM2Mapping:
+    """A read-only mapping of a logical byte range of a logical volume to a physical byte range of a physical volume.
+
+    The ``pv_offset`` is relative to the start of the data area of the physical volume, i.e. it can be used directly
+    with the stream returned by :meth:`PhysicalVolume.open`. The physical extent start (``pe_start``) of the physical
+    volume is already accounted for by that stream.
+    """
+
+    offset: int
+    size: int
+    pv: PhysicalVolume
+    pv_offset: int
+    segment: Segment
+
+    @property
+    def missing(self) -> bool:
+        """Whether the device of the physical volume is missing."""
+        return self.pv.dev is None
+
+
 @dataclass(init=False)
 class LogicalVolume(MetaBase):
     id: str
@@ -230,6 +251,40 @@ class LogicalVolume(MetaBase):
             size = segment.extent_count * extent_size
             stream.add(offset, size, segment.open())
         return stream
+
+    def map(self, offset: int = 0, size: int | None = None) -> list[LVM2Mapping]:
+        """Map a logical byte range of this logical volume to physical byte ranges of physical volumes.
+
+        Only the requested range is expanded. Parts of the range that reside on a physical volume of which the
+        device is missing are flagged with :attr:`LVM2Mapping.missing`.
+
+        Raises:
+            NotImplementedError: If part of the requested range resides on an unsupported segment type.
+        """
+        extent_size = self.volume_group.extent_size * SECTOR_SIZE
+        lv_size = max(segment.start_extent + segment.extent_count for segment in self.segments) * extent_size
+
+        if offset < 0 or (size is not None and size < 0):
+            raise ValueError("Offset and size must be positive")
+
+        if size is None:
+            size = lv_size - offset
+        end = min(offset + size, lv_size)
+
+        result = []
+        for segment in self.segments:
+            segment_offset = segment.start_extent * extent_size
+            segment_end = segment_offset + segment.extent_count * extent_size
+
+            map_offset = max(offset, segment_offset)
+            map_end = min(end, segment_end)
+            if map_offset >= map_end:
+                continue
+
+            for entry in segment.map(map_offset - segment_offset, map_end - map_offset):
+                entry.offset += segment_offset
+                result.append(entry)
+        return result
 
     def _from_dict(self, obj: dict, name: str | None = None, parent: MetaBase | None = None) -> None:
         super()._from_dict(obj, name=name, parent=parent)
@@ -313,6 +368,9 @@ class Segment(MetaBase):
     def open(self) -> BinaryIO:
         raise NotImplementedError(f"{self.__class__.__name__} is not implemented yet")
 
+    def map(self, offset: int, size: int) -> list[LVM2Mapping]:
+        raise NotImplementedError(f"{self.__class__.__name__} is not implemented yet")
+
     @classmethod
     def from_dict(cls, obj: dict, name: str | None = None, parent: MetaBase | None = None) -> Segment:
         SEGMENT_CLASS_MAP = {
@@ -375,22 +433,55 @@ class StripedSegment(Segment):
         stream = MappingStream()
         pv = self._logical_volume._volume_group.physical_volumes
         extent_size = self._logical_volume._volume_group.extent_size * SECTOR_SIZE
+        segment_size = self.extent_count * extent_size
+        stripe_size = self.stripe_size * SECTOR_SIZE if self.stripe_size is not None else segment_size
 
         opened_pv = {}
 
         offset = 0
-        for pv_name, extent_offset in self.stripes:
-            if pv_name not in opened_pv:
-                pv_fh = pv[pv_name].open()
-                opened_pv[pv_name] = pv_fh
-            else:
-                pv_fh = opened_pv[pv_name]
+        chunk = 0
+        while offset < segment_size:
+            size = min(stripe_size, segment_size - offset)
+            pv_name, extent_offset = self.stripes[chunk % self.stripe_count]
 
-            stripe_size = (self.stripe_size or self.extent_count) * extent_size
-            stream.add(offset, stripe_size, pv_fh, extent_offset * extent_size)
-            offset += stripe_size
+            if pv_name not in opened_pv:
+                opened_pv[pv_name] = pv[pv_name].open()
+
+            stream.add(
+                offset,
+                size,
+                opened_pv[pv_name],
+                extent_offset * extent_size + (chunk // self.stripe_count) * stripe_size,
+            )
+            offset += size
+            chunk += 1
 
         return stream
+
+    def map(self, offset: int, size: int) -> list[LVM2Mapping]:
+        pv = self._logical_volume._volume_group.physical_volumes
+        extent_size = self._logical_volume._volume_group.extent_size * SECTOR_SIZE
+        segment_size = self.extent_count * extent_size
+        stripe_size = self.stripe_size * SECTOR_SIZE if self.stripe_size is not None else segment_size
+
+        result = []
+        end = min(offset + size, segment_size)
+        while offset < end:
+            chunk, chunk_offset = divmod(offset, stripe_size)
+            run_size = min(stripe_size - chunk_offset, end - offset)
+            pv_name, extent_offset = self.stripes[chunk % self.stripe_count]
+
+            result.append(
+                LVM2Mapping(
+                    offset=offset,
+                    size=run_size,
+                    pv=pv[pv_name],
+                    pv_offset=extent_offset * extent_size + (chunk // self.stripe_count) * stripe_size + chunk_offset,
+                    segment=self,
+                )
+            )
+            offset += run_size
+        return result
 
     def _from_dict(self, obj: dict, name: str | None = None, parent: MetaBase | None = None) -> None:
         super()._from_dict(obj, name=name, parent=parent)
