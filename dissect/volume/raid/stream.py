@@ -166,12 +166,12 @@ class RAID0Stream(AlignedStream):
             chunk = offset_in_zone // (stripe_size * len(zone.devices))
 
             offset_in_device = (chunk * stripe_size) + offset_in_stripe
-            device_start, device = zone.devices[stripe % len(zone.devices)]
+            device_start, device = tuple(zone.devices.values())[stripe % len(zone.devices)]
 
             stripe_remaining = stripe_size - offset_in_stripe
             read_length = min(length, stripe_remaining)
 
-            offset_on_disk = device.offset + device_start + offset_in_device
+            offset_on_disk = device.offset + device_start + zone.dev_start + offset_in_device
             device.fh.seek(offset_on_disk)
             result.append(device.fh.read(read_length))
 
